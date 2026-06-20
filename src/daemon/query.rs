@@ -451,9 +451,9 @@ pub async fn q_history(
     }
 
     all_msgs.sort_by_key(|m| std::cmp::Reverse(m["timestamp"].as_i64().unwrap_or(0)));
-    let paged: Vec<Value> = all_msgs.into_iter().skip(offset).take(limit).collect();
-    let mut paged = paged;
-    paged.sort_by_key(|m| m["timestamp"].as_i64().unwrap_or(0));
+    // 取分页后直接 reverse 获得升序，省掉第二次 O(N log N) 排序
+    let mut paged: Vec<Value> = all_msgs.into_iter().skip(offset).take(limit).collect();
+    paged.reverse();
     let windowed = offset > 0 || since.is_some() || until.is_some() || msg_type.is_some();
     let unknown_shards = current_unknown_shards(db, names);
     let session_ts = session_last_timestamp(db, &username).await;
@@ -1616,10 +1616,13 @@ fn decompress_or_str(data: &[u8]) -> String {
     if data.is_empty() {
         return String::new();
     }
-    // 尝试 zstd 解压
-    if let Ok(dec) = zstd::decode_all(data) {
-        if let Ok(s) = String::from_utf8(dec) {
-            return s;
+    // zstd magic number: 0x28B52FFD (4 bytes, little-endian)
+    // 只在确认是 zstd 数据时才解压，避免对未压缩数据白跑一趟 decode_all
+    if data.len() >= 4 && data[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+        if let Ok(dec) = zstd::decode_all(data) {
+            if let Ok(s) = String::from_utf8(dec) {
+                return s;
+            }
         }
     }
     String::from_utf8_lossy(data).into_owned()
@@ -2642,12 +2645,11 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
     }
 
     let display = names.display(&username);
-    let names_map = names.map.clone();
 
     // 优先路径：contact.db → chatroom_member + chat_room（完整成员列表）
     if let Some(contact_p) = db.get("contact/contact.db").await? {
         let uname2 = username.clone();
-        let names_map2 = names_map.clone();
+        let names_map2 = names.map.clone();
 
         let members_opt: Option<Vec<Value>> = tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&contact_p)?;
@@ -2809,7 +2811,7 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
     let mut members: Vec<Value> = sender_set
         .iter()
         .map(|u| {
-            let contact_display = names_map.get(u).cloned().unwrap_or_else(|| u.clone());
+            let contact_display = names.map.get(u).cloned().unwrap_or_else(|| u.clone());
             let group_nickname = group_nicknames.get(u).cloned().unwrap_or_default();
             let display = if group_nickname.is_empty() {
                 contact_display.clone()

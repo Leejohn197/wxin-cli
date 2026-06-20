@@ -223,25 +223,49 @@ fn default_wechat_process() -> &'static str {
     }
 }
 
-/// 自动检测微信 db_storage 目录
-pub fn auto_detect_db_dir() -> Option<PathBuf> {
+/// 自动检测微信 db_storage 目录（支持多开分身，返回所有候选）
+pub fn auto_detect_db_dirs() -> Vec<PathBuf> {
     detect_db_dir_impl()
 }
 
-#[cfg(target_os = "macos")]
-fn detect_db_dir_impl() -> Option<PathBuf> {
-    let home = sudo_user_home_dir().or_else(dirs::home_dir)?;
+/// 兼容旧签名：返回第一个候选（mtime 最新的目录）
+#[allow(dead_code)]
+pub fn auto_detect_db_dir() -> Option<PathBuf> {
+    auto_detect_db_dirs().into_iter().next_back()
+}
 
-    let base = home.join("Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files");
-    if !base.exists() {
-        return None;
+#[cfg(target_os = "macos")]
+fn detect_db_dir_impl() -> Vec<PathBuf> {
+    let home = match sudo_user_home_dir().or_else(dirs::home_dir) {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+
+    let containers = home.join("Library/Containers");
+    if !containers.exists() {
+        return Vec::new();
     }
+
+    // glob com.tencent.xinWeChat* 支持标准微信 + 所有分身
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&base) {
+    if let Ok(entries) = std::fs::read_dir(&containers) {
         for entry in entries.flatten() {
-            let storage = entry.path().join("db_storage");
-            if storage.is_dir() {
-                candidates.push(storage);
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with("com.tencent.xinWeChat") {
+                continue;
+            }
+            let xwechat = entry.path().join("Data/Documents/xwechat_files");
+            if !xwechat.exists() {
+                continue;
+            }
+            if let Ok(wx_entries) = std::fs::read_dir(&xwechat) {
+                for wx_entry in wx_entries.flatten() {
+                    let storage = wx_entry.path().join("db_storage");
+                    if storage.is_dir() {
+                        candidates.push(storage);
+                    }
+                }
             }
         }
     }
@@ -250,12 +274,15 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
             .and_then(|m| m.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
     });
-    candidates.into_iter().next_back()
+    candidates
 }
 
 #[cfg(target_os = "linux")]
-fn detect_db_dir_impl() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+fn detect_db_dir_impl() -> Vec<PathBuf> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
     let sudo_home = sudo_user_home_dir();
 
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -281,7 +308,7 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
         // 这样当收到新消息时（只有 .db 文件被更新），能正确识别最新目录
         latest_db_mtime(p).unwrap_or(std::time::SystemTime::UNIX_EPOCH)
     });
-    candidates.into_iter().next_back()
+    candidates
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -308,11 +335,14 @@ fn latest_db_mtime(dir: &Path) -> Option<std::time::SystemTime> {
 }
 
 #[cfg(target_os = "windows")]
-fn detect_db_dir_impl() -> Option<PathBuf> {
-    let appdata = std::env::var("APPDATA").ok()?;
+fn detect_db_dir_impl() -> Vec<PathBuf> {
+    let appdata = match std::env::var("APPDATA") {
+        Ok(a) => a,
+        Err(_) => return Vec::new(),
+    };
     let config_dir = PathBuf::from(&appdata).join("Tencent/xwechat/config");
     if !config_dir.exists() {
-        return None;
+        return Vec::new();
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&config_dir) {
@@ -339,7 +369,7 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
         }
     }
     candidates.sort_by_key(|p| latest_db_mtime(p).unwrap_or(std::time::SystemTime::UNIX_EPOCH));
-    candidates.into_iter().next_back()
+    candidates
 }
 
 /// Resolve the data-root path that Weixin writes to its `*.ini` file under
@@ -409,8 +439,8 @@ fn known_documents_dir() -> Option<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn detect_db_dir_impl() -> Option<PathBuf> {
-    None
+fn detect_db_dir_impl() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 #[cfg(test)]

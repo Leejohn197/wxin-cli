@@ -5,8 +5,8 @@
 /// - OpenProcess: 获取进程句柄（需要 PROCESS_VM_READ | PROCESS_QUERY_INFORMATION）
 /// - VirtualQueryEx: 枚举内存区域
 /// - ReadProcessMemory: 读取内存内容
-use anyhow::{Context, Result};
-use std::path::Path;
+use anyhow::{bail, Context, Result};
+use std::path::PathBuf;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -24,29 +24,31 @@ use super::{collect_db_salts, KeyEntry};
 const HEX_PATTERN_LEN: usize = 96;
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
 
-/// 查找 Weixin.exe 进程 PID
-fn find_wechat_pid() -> Option<u32> {
+/// 查找所有 Weixin.exe 进程 PID（支持多开分身）
+fn find_all_wechat_pids() -> Vec<u32> {
     // SAFETY: CreateToolhelp32Snapshot 标准 Windows API
-    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()? };
+    let snap = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
 
     let mut entry = PROCESSENTRY32 {
         dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
         ..Default::default()
     };
 
+    let mut pids = Vec::new();
     // SAFETY: Process32First/Process32Next 标准快照遍历
     unsafe {
         if Process32First(snap, &mut entry).is_err() {
             let _ = CloseHandle(snap);
-            return None;
+            return pids;
         }
         loop {
             let name =
                 std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8).to_string_lossy();
             if name.eq_ignore_ascii_case("Weixin.exe") {
-                let pid = entry.th32ProcessID;
-                let _ = CloseHandle(snap);
-                return Some(pid);
+                pids.push(entry.th32ProcessID);
             }
             if Process32Next(snap, &mut entry).is_err() {
                 break;
@@ -54,46 +56,93 @@ fn find_wechat_pid() -> Option<u32> {
         }
         let _ = CloseHandle(snap);
     }
-    None
+    pids
 }
 
-pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
-    let pid = find_wechat_pid().context("找不到 Weixin.exe 进程，请确认微信正在运行")?;
-    eprintln!("WeChat PID: {}", pid);
-
-    // SAFETY: OpenProcess 请求读取权限
-    let process = unsafe {
-        OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid)
-            .context("OpenProcess 失败，请以管理员权限运行")?
-    };
-
-    let db_salts = collect_db_salts(db_dir);
-    eprintln!("找到 {} 个加密数据库", db_salts.len());
-
-    eprintln!("扫描进程内存...");
-    let raw_keys = scan_memory(process)?;
-    eprintln!("找到 {} 个候选密钥", raw_keys.len());
-
-    // SAFETY: 关闭进程句柄
-    unsafe {
-        let _ = CloseHandle(process);
+pub fn scan_keys(db_dirs: &[PathBuf]) -> Result<Vec<KeyEntry>> {
+    let pids = find_all_wechat_pids();
+    if pids.is_empty() {
+        bail!("找不到 Weixin.exe 进程，请确认微信正在运行");
     }
+    eprintln!("找到 {} 个微信进程: {:?}", pids.len(), pids);
 
-    let mut entries = Vec::new();
-    for (key_hex, salt_hex) in &raw_keys {
-        for (db_salt, db_name) in &db_salts {
-            if salt_hex == db_salt {
-                entries.push(KeyEntry {
-                    db_name: db_name.clone(),
-                    enc_key: key_hex.clone(),
-                    salt: salt_hex.clone(),
-                });
-                break;
+    // 收集所有 db_dir 的 salt 映射
+    let all_db_salts: Vec<(&PathBuf, Vec<(String, String)>)> = db_dirs
+        .iter()
+        .map(|dir| {
+            let salts = collect_db_salts(dir);
+            eprintln!("目录 {} 找到 {} 个加密数据库", dir.display(), salts.len());
+            (dir, salts)
+        })
+        .collect();
+
+    for pid in &pids {
+        eprintln!("尝试 PID {} ...", pid);
+
+        // SAFETY: OpenProcess 请求读取权限
+        let process = match unsafe {
+            OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, *pid)
+        } {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("  PID {} OpenProcess 失败，跳过", pid);
+                continue;
+            }
+        };
+
+        let raw_keys = match scan_memory(process) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("  PID {} 扫描内存失败: {}，跳过", pid, e);
+                unsafe { let _ = CloseHandle(process); }
+                continue;
+            }
+        };
+        eprintln!("  PID {} 找到 {} 个候选密钥", pid, raw_keys.len());
+
+        // SAFETY: 关闭进程句柄
+        unsafe { let _ = CloseHandle(process); }
+
+        if raw_keys.is_empty() {
+            continue;
+        }
+
+        // 尝试匹配每个 db_dir
+        for (db_dir, db_salts) in &all_db_salts {
+            if db_salts.is_empty() {
+                continue;
+            }
+            let mut entries = Vec::new();
+            for (key_hex, salt_hex) in &raw_keys {
+                for (db_salt, db_name) in db_salts {
+                    if salt_hex == db_salt {
+                        entries.push(KeyEntry {
+                            db_name: db_name.clone(),
+                            enc_key: key_hex.clone(),
+                            salt: salt_hex.clone(),
+                        });
+                        break;
+                    }
+                }
+            }
+            if !entries.is_empty() {
+                eprintln!(
+                    "  PID {} × {} 匹配到 {} 个密钥 ✓",
+                    pid,
+                    db_dir.display(),
+                    entries.len()
+                );
+                return Ok(entries);
             }
         }
+        eprintln!("  PID {} 的密钥与所有数据目录均不匹配", pid);
     }
-    eprintln!("匹配到 {}/{} 个密钥", entries.len(), raw_keys.len());
-    Ok(entries)
+
+    bail!(
+        "扫描了 {} 个进程、{} 个数据目录，均未匹配到密钥",
+        pids.len(),
+        db_dirs.len()
+    )
 }
 
 fn scan_memory(process: HANDLE) -> Result<Vec<(String, String)>> {

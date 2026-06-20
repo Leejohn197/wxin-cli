@@ -33,20 +33,31 @@ pub fn cmd_init(force: bool) -> Result<()> {
         }
     }
 
-    // Step 1: 检测 db_dir
+    // Step 1: 检测所有可能的 db_dir（支持多开分身）
     println!("检测微信数据目录...");
-    let db_dir = config::auto_detect_db_dir().with_context(|| format!(
-        "未能自动检测到微信数据目录\n\
-         请编辑配置文件并填写 db_dir 字段:\n  \
-         {}\n\
-         （文件不存在则首次保存后自动创建；db_dir 示例: <data_root>\\xwechat_files\\<wxid>\\db_storage）",
-        config_path.display()
-    ))?;
-    println!("找到数据目录: {}", db_dir.display());
+    let db_dirs = config::auto_detect_db_dirs();
+    if db_dirs.is_empty() {
+        anyhow::bail!(
+            "未能自动检测到微信数据目录\n\
+             请编辑配置文件并填写 db_dir 字段:\n  \
+             {}\n\
+             （文件不存在则首次保存后自动创建；db_dir 示例: <data_root>\\xwechat_files\\<wxid>\\db_storage）",
+            config_path.display()
+        );
+    }
+    for dir in &db_dirs {
+        println!("  找到数据目录: {}", dir.display());
+    }
 
-    // Step 2: 扫描密钥（需要 root/sudo）
+    // Step 2: 扫描密钥（需要 root/sudo），自动匹配进程与数据目录
     println!("扫描加密密钥（需要 root 权限）...");
-    let entries = scanner::scan_keys(&db_dir)?;
+    let entries = scanner::scan_keys(&db_dirs)?;
+
+    // 确定实际匹配到的 db_dir（哪个目录命中最多 entry）
+    let matched_db_dir = db_dirs.iter()
+        .max_by_key(|dir| entries.iter().filter(|e| dir.join(&e.db_name).exists()).count())
+        .unwrap_or(&db_dirs[0]);
+    println!("匹配的数据目录: {}", matched_db_dir.display());
 
     // === 权限边界 ===
     // 扫描完成后立即 drop 到调用用户身份，后续文件写入都是用户属主。
@@ -89,7 +100,7 @@ pub fn cmd_init(force: bool) -> Result<()> {
             }
         }
     }
-    cfg.insert("db_dir".into(), json!(db_dir.to_string_lossy()));
+    cfg.insert("db_dir".into(), json!(matched_db_dir.to_string_lossy()));
     cfg.entry("keys_file".into()).or_insert_with(|| json!("all_keys.json"));
     cfg.entry("decrypted_dir".into()).or_insert_with(|| json!("decrypted"));
 

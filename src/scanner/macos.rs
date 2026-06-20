@@ -9,8 +9,8 @@
 /// 1. 需要以 root (sudo) 运行
 /// 2. WeChat 需要进行 ad-hoc 签名
 /// 3. 在内存中搜索 x'<64hex><32hex>' 格式的 SQLCipher 密钥
-use anyhow::{bail, Context, Result};
-use std::path::Path;
+use anyhow::{bail, Result};
+use std::path::PathBuf;
 
 use super::{collect_db_salts, KeyEntry};
 
@@ -77,18 +77,17 @@ extern "C" {
     ) -> kern_return_t;
 }
 
-/// 查找 WeChat 进程的 PID
-fn find_wechat_pid() -> Option<libc::pid_t> {
-    // 使用 pgrep -x WeChat 查找（与 C 版本一致）
-    let output = std::process::Command::new("pgrep")
+/// 查找所有 WeChat 进程的 PID（支持多开分身）
+fn find_all_wechat_pids() -> Vec<libc::pid_t> {
+    let output = match std::process::Command::new("pgrep")
         .args(["-x", "WeChat"])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
     let s = String::from_utf8_lossy(&output.stdout);
-    s.trim().parse().ok()
+    s.lines().filter_map(|line| line.trim().parse().ok()).collect()
 }
 
 /// 判断字节是否是 ASCII 十六进制字符
@@ -97,67 +96,85 @@ fn is_hex_char(c: u8) -> bool {
     c.is_ascii_hexdigit()
 }
 
-pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
-    // 1. 查找 WeChat PID
-    let pid = find_wechat_pid()
-        .context("找不到 WeChat 进程，请确认 WeChat 正在运行")?;
-    eprintln!("WeChat PID: {}", pid);
+pub fn scan_keys(db_dirs: &[PathBuf]) -> Result<Vec<KeyEntry>> {
+    // 1. 查找所有 WeChat 进程
+    let pids = find_all_wechat_pids();
+    if pids.is_empty() {
+        bail!("找不到 WeChat 进程，请确认 WeChat 正在运行");
+    }
+    eprintln!("找到 {} 个 WeChat 进程: {:?}", pids.len(), pids);
 
-    // 2. 获取 task port
-    // SAFETY: task_for_pid 是标准 Mach API，参数合法
-    let task = unsafe {
-        let mut task: mach_port_t = 0;
-        let kr = task_for_pid(mach_task_self(), pid, &mut task);
-        if kr != KERN_SUCCESS {
-            bail!(
-                "task_for_pid 失败 (kr={})。请按以下步骤修复：\n\
-                \n\
-                  1. 对 WeChat 重新签名（只需做一次）：\n\
-                     codesign --force --deep --sign - /Applications/WeChat.app\n\
-                \n\
-                  2. 重启 WeChat：\n\
-                     killall WeChat && open /Applications/WeChat.app\n\
-                \n\
-                  3. 再次运行（需要 root）：\n\
-                     sudo wx init\n\
-                \n\
-                如果 codesign 报 \"signature in use\"，先执行：\n\
-                     codesign --remove-signature /Applications/WeChat.app/Contents/Frameworks/vlc_plugins/librtp_mpeg4_plugin.dylib\n\
-                     codesign --force --deep --sign - /Applications/WeChat.app",
-                kr
-            );
+    // 2. 收集所有 db_dir 的 salt 映射
+    let all_db_salts: Vec<(&PathBuf, Vec<(String, String)>)> = db_dirs
+        .iter()
+        .map(|dir| {
+            let salts = collect_db_salts(dir);
+            eprintln!("目录 {} 找到 {} 个加密数据库", dir.display(), salts.len());
+            (dir, salts)
+        })
+        .collect();
+
+    // 3. 遍历每个进程，扫描内存，尝试匹配所有 db_dir
+    for pid in &pids {
+        eprintln!("尝试 PID {} ...", pid);
+
+        // 获取 task port
+        // SAFETY: task_for_pid 是标准 Mach API，参数合法
+        let task = unsafe {
+            let mut task: mach_port_t = 0;
+            let kr = task_for_pid(mach_task_self(), *pid, &mut task);
+            if kr != KERN_SUCCESS {
+                eprintln!("  PID {} task_for_pid 失败 (kr={})，跳过", pid, kr);
+                continue;
+            }
+            task
+        };
+        eprintln!("  PID {} 获得 task port: {}", pid, task);
+
+        // 扫描进程内存
+        let raw_keys = scan_memory(task)?;
+        eprintln!("  PID {} 找到 {} 个候选密钥", pid, raw_keys.len());
+
+        if raw_keys.is_empty() {
+            continue;
         }
-        task
-    };
-    eprintln!("Got task port: {}", task);
 
-    // 3. 收集数据库 salt 映射
-    eprintln!("扫描数据库文件...");
-    let db_salts = collect_db_salts(db_dir);
-    eprintln!("找到 {} 个加密数据库", db_salts.len());
-
-    // 4. 扫描进程内存
-    eprintln!("扫描进程内存寻找密钥...");
-    let raw_keys = scan_memory(task)?;
-    eprintln!("找到 {} 个候选密钥", raw_keys.len());
-
-    // 5. 将密钥与数据库 salt 匹配
-    let mut entries = Vec::new();
-    for (key_hex, salt_hex) in &raw_keys {
-        for (db_salt, db_name) in &db_salts {
-            if salt_hex == db_salt {
-                entries.push(KeyEntry {
-                    db_name: db_name.clone(),
-                    enc_key: key_hex.clone(),
-                    salt: salt_hex.clone(),
-                });
-                break;
+        // 尝试匹配每个 db_dir 的 salt
+        for (db_dir, db_salts) in &all_db_salts {
+            if db_salts.is_empty() {
+                continue;
+            }
+            let mut entries = Vec::new();
+            for (key_hex, salt_hex) in &raw_keys {
+                for (db_salt, db_name) in db_salts {
+                    if salt_hex == db_salt {
+                        entries.push(KeyEntry {
+                            db_name: db_name.clone(),
+                            enc_key: key_hex.clone(),
+                            salt: salt_hex.clone(),
+                        });
+                        break;
+                    }
+                }
+            }
+            if !entries.is_empty() {
+                eprintln!(
+                    "  PID {} × {} 匹配到 {} 个密钥 ✓",
+                    pid,
+                    db_dir.display(),
+                    entries.len()
+                );
+                return Ok(entries);
             }
         }
+        eprintln!("  PID {} 的密钥与所有数据目录均不匹配", pid);
     }
 
-    eprintln!("匹配到 {}/{} 个密钥", entries.len(), raw_keys.len());
-    Ok(entries)
+    bail!(
+        "扫描了 {} 个进程、{} 个数据目录，均未匹配到密钥",
+        pids.len(),
+        db_dirs.len()
+    )
 }
 
 /// 扫描进程内存，返回 (key_hex, salt_hex) 列表

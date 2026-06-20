@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -23,13 +23,14 @@ pub struct KeyEntry {
 /// 从进程内存中扫描所有 SQLCipher 密钥
 ///
 /// 需要以 root/Administrator 权限运行
-pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
+/// db_dirs: 所有可能的数据目录（支持多开分身）
+pub fn scan_keys(db_dirs: &[PathBuf]) -> Result<Vec<KeyEntry>> {
     #[cfg(target_os = "macos")]
-    return macos::scan_keys(db_dir);
+    return macos::scan_keys(db_dirs);
     #[cfg(target_os = "linux")]
-    return linux::scan_keys(db_dir);
+    return linux::scan_keys(db_dirs);
     #[cfg(target_os = "windows")]
-    return windows::scan_keys(db_dir);
+    return windows::scan_keys(db_dirs);
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         anyhow::bail!("当前平台不支持自动密钥扫描")
